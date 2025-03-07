@@ -103,6 +103,20 @@ if [[ $? -ne 0 || -z "$WS_PATH" ]]; then
     exit 1
 fi
 
+get_mount_point() {
+    local file_path="$1"
+    df -P "$file_path" | awk 'NR==2 {print $6}'
+}
+# Determine which file system
+MOUNTPOINT=$(get_mount_point "$WS_PATH")
+# Determine if it's using nfs4
+# equivalent to:  pcregrep -o1 " $MOUNTPOINT .*vers=(.)" /proc/mounts
+NFS_VERS=$(grep " $MOUNTPOINT nfs.*vers=" /proc/mounts | sed -E 's/.*vers=(.).*/\1/')
+USE_NFS4=0
+if [ -n "$NFS_VERS" ] && [ "$NFS_VERS" -ge 4 ]; then
+    USE_NFS4=1
+fi
+
 case $ACTION in
     list)
         getfacl -ap --omit-header "$WS_PATH" | grep user | cut -d : -f 2 | grep -v '^$'
@@ -110,6 +124,7 @@ case $ACTION in
     share)
         USERS="$@"
         MACL=""
+        NFS4_ACL=""
         for user in $USERS; do
             id "$user" >/dev/null 2>&1
             if [[ $? -ne 0 ]]; then
@@ -119,12 +134,23 @@ case $ACTION in
             echo "Granting access for $user ..."
             MACL+="user:$user:rX,"
             MACL+="default:user:$user:rX,"
+            SHARE_UID=$(id -ru "$user")
+            NFS4_ACL+="A:d:$SHARE_UID:RWX,"
         done
         if [[ -z "$MACL" ]]; then
             # nothing to do
             exit 0
         fi
-        setfacl -R -m "$MACL" "$WS_PATH"
+
+        # Test if the mechanism works only on the top level before recursing
+        if [ "$USE_NFS4" == 1 ];  then
+            nfs4_setfacl -R -a "$NFS4_ACL" "$WS_PATH"
+        else
+            setfacl -R -m "$MACL" "$WS_PATH"
+        fi
+        if [ "$?" -eq 0 ]; then
+            echo "Success!"
+        fi
         ;;
     unshare)
         USERS="$@"
@@ -138,15 +164,35 @@ case $ACTION in
             echo "Removing access for $user"
             XACL+="user:$user,"
             XACL+="default:user:$user,"
+            SHARE_UIDS+="$(id -ru $user)@"
         done
         if [[ -z "$XACL" ]]; then
             # nothing to do
             exit 0
         fi
-        setfacl -R -x "$XACL" "$WS_PATH"
+        if [ "$USE_NFS4" == 1 ];  then
+            echo "Removing ACLs:"
+            nfs4_getfacl -c "$WS_PATH"  |  grep -f <(echo "${SHARE_UIDS%%@}" | tr "@" "\n")
+            nfs4_getfacl -c "$WS_PATH"  |  grep -f <(echo "${SHARE_UIDS%%@}" | tr "@" "\n") | nfs4_setfacl -R -X - "$WS_PATH"
+        else
+            setfacl -R -x "$XACL" "$WS_PATH"
+        fi
+        if [ "$?" -eq 0 ]; then
+            echo "Success!"
+        fi
         ;;
     unshare-all)
-        setfacl -R -b "$WS_PATH"
+        if [ "$USE_NFS4" == 1 ];  then
+            echo "Removing ACLs:"
+            # Default rules don't have UID numbers
+            nfs4_getfacl -c "$WS_PATH"  |  grep -wEe "[0-9]+"
+            nfs4_getfacl -c "$WS_PATH"  |  grep -wEe "[0-9]+"  |  nfs4_setfacl -R -X - "$WS_PATH"
+        else
+            setfacl -R -b "$WS_PATH"
+        fi
+        if [ "$?" -eq 0 ]; then
+            echo "Success!"
+        fi
         ;;
     check)
         ;;
@@ -155,4 +201,3 @@ case $ACTION in
         usage
         exit 1
 esac
-
